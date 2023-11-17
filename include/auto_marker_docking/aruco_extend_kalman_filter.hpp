@@ -12,7 +12,7 @@ public:
     void predict(const Eigen::Vector2d& u);
     void update(const Eigen::Vector3d& z);
 
-    void set(const Eigen::Vector3d& x) { X_ = x; };
+    void set(const Eigen::Vector3d& X) { X_ = X; };
 
     Eigen::Vector3d getState() { return X_; }
 
