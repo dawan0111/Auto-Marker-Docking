@@ -21,7 +21,7 @@ add_executable(auto_marker_docking_node
   src/auto_marker_docking_node.cpp
   src/aruco_marker_detector.cpp
   src/PD_controller.cpp
-  src/aruco_extend_kalman_filter.cpp
+  src/aruco_kalman_filter.cpp
 )
 ament_target_dependencies(auto_marker_docking_node
   rclcpp

@@ -5,6 +5,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
+inline constexpr double Half_PI = 3.14159265358979323846 * 0.5;
 
 inline Eigen::Quaterniond rodrigues_to_quaternion(double rx, double ry, double rz) {
     // 벡터의 크기를 계산하여 각도(θ)를 얻습니다.
@@ -22,6 +23,17 @@ inline Eigen::Quaterniond rodrigues_to_quaternion(double rx, double ry, double r
     Eigen::Quaterniond q(std::cos(halfTheta), ux * sinHalfTheta, uy * sinHalfTheta, uz * sinHalfTheta);
 
     return q;
+}
+
+inline double radian_normalization(double radian)
+{
+    if (radian < Half_PI * -1) {
+        radian = Half_PI + (radian + Half_PI);
+    } else if (radian > Half_PI) {
+        radian = (Half_PI * -1) + (radian - Half_PI);
+    }
+
+    return radian;
 }
 
 #endif

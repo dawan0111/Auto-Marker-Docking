@@ -14,6 +14,7 @@
 #include <tf2_eigen/tf2_eigen.h>
 
 #include "auto_marker_docking/aruco_marker_detector.hpp"
+#include "auto_marker_docking/aruco_kalman_filter.hpp"
 #include "auto_marker_docking/utils.hpp"
 
 class AutoMarkerDockingNode : public rclcpp::Node {
@@ -49,6 +50,26 @@ public:
       aurco_marker_dictionary_id_
     );
 
+    Eigen::Vector3d initial_pose;    
+    Eigen::Matrix3d initial_conv;    
+    Eigen::Matrix3d predict_noise;    
+    Eigen::Matrix3d measure_noise;
+
+    initial_pose << 0, 0, 0;
+    initial_conv << 0.01, 0, 0,
+                    0, 0.01, 0,
+                    0, 0, 0.005;
+
+    predict_noise << 0.005, 0, 0,
+                    0, 0.005, 0,
+                    0, 0, 0.001;
+
+    measure_noise << 0.005, 0, 0,
+                    0, 0.005, 0,
+                    0, 0, 0.18;
+
+    aruco_kalman_filter_ptr_ = std::make_shared<ArucoKalmanFilter>(initial_pose, initial_conv, predict_noise, measure_noise);
+
     has_detected_marker_ = false;
 
     timer_ = this->create_wall_timer(
@@ -73,19 +94,24 @@ private:
   void timer_callback()
   {
     if (has_detected_marker_) {
+      Eigen::Vector3d state_predict = Eigen::Vector3d::Zero();
+      aruco_kalman_filter_ptr_->predict(state_predict);
       Eigen::Isometry3d aruco_waypoint_pose = Eigen::Isometry3d::Identity();
-      Eigen::Vector3d euler = detect_marker_pose_.rotation().eulerAngles(2, 1, 0);
-      Eigen::Vector3d translation = detect_marker_pose_.translation();
+      Eigen::Isometry3d filter_marker_pose = aruco_kalman_filter_ptr_->get_state();
+
+      Eigen::Vector3d euler = filter_marker_pose.rotation().eulerAngles(2, 1, 0);
+      Eigen::Vector3d translation = filter_marker_pose.translation();
+
       double yaw = euler[0];
 
-      aruco_waypoint_pose.translate(Eigen::Vector3d(0, 0, 0.3));
-
+      aruco_waypoint_pose.translate(Eigen::Vector3d(0, 0.5, 0));
+      // std::cout << "filter: " << filter_marker_pose << std::endl;
       // aruco_waypoint.translate(Eigen::Vector3d(0, waypoint_translation[1] * -1, 0));
-
-      RCLCPP_INFO(this->get_logger(), "marker: x: %f, y: %f, yaw: %f", translation[0], translation[1], yaw);
       // Convert Eigen::Isometry3d to geometry_msgs::msg::TransformStamped
+      send_aruco_transform(filter_marker_pose, "camera_link", "filter_aruco_link");
       send_aruco_transform(detect_marker_pose_, "camera_link", "aruco_link");
-      send_aruco_transform(aruco_waypoint_pose, "aruco_link", "aruco_waypoint");
+      send_aruco_transform(aruco_waypoint_pose, "aruco_link", "aruco_link_3m");
+      // send_aruco_transform(aruco_waypoint_pose, "aruco_link", "aruco_waypoint");
       
     }
       // 타이머 콜백에서 수행할 작업을 여기에 추가하세요.
@@ -104,13 +130,16 @@ private:
       auto marker_rotate = marker_rotates[0];
 
       Eigen::Vector3d translation(marker_translate[0], 0.0, marker_translate[2]);
-      Eigen::Quaterniond quaternion = rodrigues_to_quaternion(0.0, marker_rotate[1], 0.0);
+      Eigen::AngleAxisd rotation(radian_normalization(marker_rotate[1]), Eigen::Vector3d::UnitZ());
 
-      detect_marker_pose_.translate(translation);
-      detect_marker_pose_.rotate(quaternion);
+      detect_marker_pose_.translate(T_world_image_ * translation);
+      detect_marker_pose_.rotate(rotation);
 
-      detect_marker_pose_ = T_world_image_ * detect_marker_pose_;
+      detect_marker_pose_ = detect_marker_pose_;
       has_detected_marker_ = true;
+
+      Eigen::Vector3d update_state(detect_marker_pose_.translation().x(), detect_marker_pose_.translation().y(), marker_rotate[1]);
+      aruco_kalman_filter_ptr_->update(update_state);
     } else {
       has_detected_marker_ = false;
       RCLCPP_INFO(this->get_logger(), "no detect aruco marker!!");
@@ -145,6 +174,7 @@ private:
   Eigen::Isometry3d T_world_image_;
 
   std::shared_ptr<ArucoMarkerDetector> aruco_marker_detector_ptr_;
+  std::shared_ptr<ArucoKalmanFilter> aruco_kalman_filter_ptr_;
 };
 
 int main(int argc, char **argv) {
