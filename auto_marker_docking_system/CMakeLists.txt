@@ -8,6 +8,7 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(auto_marker_docking_interface REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
@@ -24,6 +25,7 @@ add_executable(auto_marker_docking_node
   src/aruco_kalman_filter.cpp
 )
 ament_target_dependencies(auto_marker_docking_node
+  auto_marker_docking_interface
   rclcpp
   sensor_msgs
   cv_bridge

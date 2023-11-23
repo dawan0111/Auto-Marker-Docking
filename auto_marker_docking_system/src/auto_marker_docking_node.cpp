@@ -1,4 +1,7 @@
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
+#include "rclcpp_components/register_node_macro.hpp"
+
 #include <cstdio>
 #include <cmath>
 #include <memory>
@@ -20,7 +23,7 @@
 #include "auto_marker_docking/PD_controller.hpp"
 #include "auto_marker_docking/utils.hpp"
 
-class AutoMarkerDockingNode : public rclcpp::Node {
+class AutoMarkerDockingActionServer : public rclcpp::Node {
 public:
   enum Step {
       DETECTION,
@@ -31,7 +34,7 @@ public:
       END
   };
 
-  AutoMarkerDockingNode() : Node("auto_marker_docking_node") {
+  AutoMarkerDockingActionServer() : Node("auto_marker_docking_node") {
     current_step_ = DETECTION;
     RCLCPP_INFO(this->get_logger(), "auto_marker_docking_node");
 
@@ -41,7 +44,7 @@ public:
 
     image_subscription_ = this->create_subscription<sensor_msgs::msg::Image>(
         "/camera/image_raw", 10,
-        std::bind(&AutoMarkerDockingNode::image_callback_, this,
+        std::bind(&AutoMarkerDockingActionServer::image_callback_, this,
                   std::placeholders::_1));
 
     camera_intrinsic_ = (cv::Mat_<float>(3, 3) << 1696.80268, 0.0, 960.5, 0.0,
@@ -107,7 +110,7 @@ public:
 
     timer_ = this->create_wall_timer(
             std::chrono::milliseconds(30), 
-            std::bind(&AutoMarkerDockingNode::timer_callback, this));
+            std::bind(&AutoMarkerDockingActionServer::timer_callback, this));
   }
 
 private:
@@ -337,7 +340,7 @@ private:
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<AutoMarkerDockingNode>());
+  rclcpp::spin(std::make_shared<AutoMarkerDockingActionServer>());
   rclcpp::shutdown();
 
   return 0;
