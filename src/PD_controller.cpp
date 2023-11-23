@@ -4,7 +4,7 @@ PDController::PDController(const Eigen::Vector3d& kp, const Eigen::Vector3d& kd)
     : kp_(kp), kd_(kd), target_(Eigen::Vector3d::Zero()), previous_error_(Eigen::Vector3d::Zero()) {}
 
 // 목표값 설정 구현
-void PDController::setTarget(const Eigen::Vector3d& target) {
+void PDController::set_target(const Eigen::Vector3d& target) {
     target_ = target;
 }
 
