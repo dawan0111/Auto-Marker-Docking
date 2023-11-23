@@ -1,13 +1,15 @@
 #include "rclcpp/rclcpp.hpp"
 #include <cstdio>
+#include <cmath>
 #include <memory>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <opencv2/opencv.hpp>
 #include <opencv2/aruco.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <geometry_msgs/msg/twist.hpp>
 #include <cv_bridge/cv_bridge.h>
-
+#include <tf2_ros/transform_listener.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 
@@ -15,13 +17,27 @@
 
 #include "auto_marker_docking/aruco_marker_detector.hpp"
 #include "auto_marker_docking/aruco_kalman_filter.hpp"
+#include "auto_marker_docking/PD_controller.hpp"
 #include "auto_marker_docking/utils.hpp"
 
 class AutoMarkerDockingNode : public rclcpp::Node {
 public:
+  enum Step {
+      DETECTION,
+      WAYPOINT_1,
+      WAYPOINT_2,
+      ARUCO_1,
+      ARUCO_2,
+      END
+  };
+
   AutoMarkerDockingNode() : Node("auto_marker_docking_node") {
+    current_step_ = DETECTION;
     RCLCPP_INFO(this->get_logger(), "auto_marker_docking_node");
+
     tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+
+    cmd_vel_publisher_ = this->create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
 
     image_subscription_ = this->create_subscription<sensor_msgs::msg::Image>(
         "/camera/image_raw", 10,
@@ -70,10 +86,27 @@ public:
 
     aruco_kalman_filter_ptr_ = std::make_shared<ArucoKalmanFilter>(initial_pose, initial_conv, predict_noise, measure_noise);
 
+    // PD Conotroller setup
+    Eigen::Vector3d p_gain;    
+    Eigen::Vector3d d_gain;
+
+    p_gain << 0.25, 0.25, 0.25;    
+    d_gain << 0.01, 0.01, 0.01;    
+
+    PD_controller_ptr_ = std::make_shared<PDController>(p_gain, d_gain);
+    PD_controller_ptr_->set_target(Eigen::Vector3d(0.0, 0.0, 0.0));
+
+    robot_pose_ = Eigen::Isometry3d();
+    robot_velocity_input_ = Eigen::Vector2d::Zero();
+
+    max_anguler_vel_ = 0.25;
+    max_linear_vel_ = 0.3;
+
     has_detected_marker_ = false;
+    detected_count_ = 0;
 
     timer_ = this->create_wall_timer(
-            std::chrono::microseconds(30), 
+            std::chrono::milliseconds(30), 
             std::bind(&AutoMarkerDockingNode::timer_callback, this));
   }
 
@@ -91,36 +124,122 @@ private:
     }
   }
 
+  void publish_cmd_vel()
+  {
+    auto message = geometry_msgs::msg::Twist();
+    message.linear.x = robot_velocity_input_(0);
+    message.angular.z = robot_velocity_input_(1);
+
+    cmd_vel_publisher_->publish(message);
+  }
+
   void timer_callback()
   {
     if (has_detected_marker_) {
-      Eigen::Vector3d state_predict = Eigen::Vector3d::Zero();
+      Eigen::Vector3d state_predict = get_predict_vector(0.03);
       aruco_kalman_filter_ptr_->predict(state_predict);
-      Eigen::Isometry3d aruco_waypoint_pose = Eigen::Isometry3d::Identity();
+
       Eigen::Isometry3d filter_marker_pose = aruco_kalman_filter_ptr_->get_state();
+      Eigen::Isometry3d T_aruco_waypoint = Eigen::Isometry3d::Identity();
 
-      Eigen::Vector3d euler = filter_marker_pose.rotation().eulerAngles(2, 1, 0);
-      Eigen::Vector3d translation = filter_marker_pose.translation();
+      T_aruco_waypoint.translate(Eigen::Vector3d(0.4, 0.0, 0.0));
+      Eigen::Isometry3d aruco_waypoint_pose  = filter_marker_pose * T_aruco_waypoint;
 
-      double yaw = euler[0];
+      auto translation = aruco_waypoint_pose.translation();
+      auto euler = aruco_waypoint_pose.rotation().eulerAngles(2, 1, 0);
 
-      aruco_waypoint_pose.translate(Eigen::Vector3d(0, 0.5, 0));
-      // std::cout << "filter: " << filter_marker_pose << std::endl;
-      // aruco_waypoint.translate(Eigen::Vector3d(0, waypoint_translation[1] * -1, 0));
-      // Convert Eigen::Isometry3d to geometry_msgs::msg::TransformStamped
-      send_aruco_transform(filter_marker_pose, "camera_link", "filter_aruco_link");
-      send_aruco_transform(detect_marker_pose_, "camera_link", "aruco_link");
-      send_aruco_transform(aruco_waypoint_pose, "aruco_link", "aruco_link_3m");
-      // send_aruco_transform(aruco_waypoint_pose, "aruco_link", "aruco_waypoint");
+      if (current_step_ == ARUCO_1 || current_step_ == ARUCO_2) {
+        translation = filter_marker_pose.translation();
+        euler = filter_marker_pose.rotation().eulerAngles(2, 1, 0);
+      }
+
+      Eigen::Vector3d output = PD_controller_ptr_->update(
+        Eigen::Vector3d(translation(0) * -1.0, translation(1) * -1.0, euler[0]),
+        30
+      );
+      Eigen::Vector2d velocity = xy_to_polar_coordinates(output(0), output(1));
+
+      if (velocity(0) < max_linear_vel_ * -1) {
+        velocity(0) = max_linear_vel_ * -1;
+      }
+      if (velocity(0) > max_linear_vel_) {
+        velocity(0) = max_linear_vel_;
+      }
+
+      if (velocity(1) < max_anguler_vel_ * -1) {
+        velocity(1) = max_anguler_vel_ * -1;
+      }
+      if (velocity(1) > max_anguler_vel_) {
+        velocity(1) = max_anguler_vel_;
+      }
       
+
+      if (current_step_ == DETECTION) {
+        if (detected_count_ >= 100) {
+          current_step_ = WAYPOINT_1;
+          RCLCPP_INFO(this->get_logger(), "change step: DETECTION -> WAYPOINT_1");
+
+        }
+      } else if (current_step_ == WAYPOINT_1) {
+        robot_velocity_input_(0) = 0.0;
+        robot_velocity_input_(1) = velocity(1);
+
+        if (std::abs(velocity(1)) <= 0.075) {
+          current_step_ = WAYPOINT_2;
+          RCLCPP_INFO(this->get_logger(), "change step: WAYPOINT_1 -> WAYPOINT_2");
+        }
+      } else if (current_step_ == WAYPOINT_2) {
+        robot_velocity_input_(0) = velocity(0);
+        robot_velocity_input_(1) = 0.0;
+
+        if (std::abs(translation(0)) <= 0.02) {
+          current_step_ = ARUCO_1;
+          RCLCPP_INFO(this->get_logger(), "change step: WAYPOINT_2 -> ARUCO_1");
+        }
+      } else if (current_step_ == ARUCO_1) {
+        robot_velocity_input_(0) = 0.0;
+        robot_velocity_input_(1) = velocity(1);
+
+        if (std::abs(velocity(1)) <= 0.0075) {
+          current_step_ = ARUCO_2;
+          RCLCPP_INFO(this->get_logger(), "change step: ARUCO_1 -> ARUCO_2");
+        }
+      } else if (current_step_ == ARUCO_2) {
+        bool linear_finish = false;
+        bool anguler_finish = false;
+        robot_velocity_input_(0) = velocity(0);
+        robot_velocity_input_(1) = velocity(1);
+
+        if (std::abs(translation(0)) <= 0.1) {
+          linear_finish = true;
+          robot_velocity_input_(0) = 0.0;
+        }
+
+        if (std::abs(velocity(1)) <= 0.001) {
+          anguler_finish = true;
+          robot_velocity_input_(1) = 0.0;
+        }
+
+        if (linear_finish && anguler_finish) {
+          current_step_ = END;
+          RCLCPP_INFO(this->get_logger(), "change step: ARUCO_2 -> END");
+        }
+      } else {
+        robot_velocity_input_(0) = 0.0;
+        robot_velocity_input_(1) = 0.0;
+      }
+
+      publish_cmd_vel();
+      send_aruco_transform(filter_marker_pose, "camera_link", "filter_aruco_link");
+      send_aruco_transform(aruco_waypoint_pose, "camera_link", "aruco_waypoint1"); 
     }
-      // 타이머 콜백에서 수행할 작업을 여기에 추가하세요.
   }
 
   void detect_aruco_marker(const cv::Mat& image) {
     auto is_success = aruco_marker_detector_ptr_->detectMarkers(image);
 
     if (is_success) {
+      detected_count_ += 1;
       detect_marker_pose_ = Eigen::Isometry3d::Identity();
 
       auto marker_rotates = aruco_marker_detector_ptr_->getRotationVectors();
@@ -128,6 +247,8 @@ private:
 
       auto marker_translate = marker_translates[0];
       auto marker_rotate = marker_rotates[0];
+
+      marker_rotate[1] = marker_rotate[1] * -1;
 
       Eigen::Vector3d translation(marker_translate[0], 0.0, marker_translate[2]);
       Eigen::AngleAxisd rotation(radian_normalization(marker_rotate[1]), Eigen::Vector3d::UnitZ());
@@ -140,9 +261,6 @@ private:
 
       Eigen::Vector3d update_state(detect_marker_pose_.translation().x(), detect_marker_pose_.translation().y(), marker_rotate[1]);
       aruco_kalman_filter_ptr_->update(update_state);
-    } else {
-      has_detected_marker_ = false;
-      RCLCPP_INFO(this->get_logger(), "no detect aruco marker!!");
     }
   }
 
@@ -158,12 +276,47 @@ private:
     tf_broadcaster_->sendTransform(tfs);
   }
 
+  Eigen::Vector3d get_predict_vector(double dt)
+  {
+    Eigen::Isometry3d pose_p = aruco_kalman_filter_ptr_->get_state();
+    auto euler = pose_p.rotation().eulerAngles(2, 1, 0);
+    Eigen::Vector2d measure_polar = xy_to_polar_coordinates(
+      pose_p.translation().x(), pose_p.translation().y()
+    );
+
+    Eigen::Vector3d state_predict = Eigen::Vector3d::Zero();
+    double r = measure_polar(0);
+    double delta = measure_polar(1);
+    double linear = robot_velocity_input_(0);
+    double anguler = robot_velocity_input_(1);
+    double yaw = euler[0];
+
+    if (yaw < Half_PI) {
+      yaw = yaw + PI;
+    }
+    if (yaw < 0 && Half_PI * -1 < yaw) {
+      yaw = yaw - PI;
+    }
+
+    double new_delta = delta + anguler * dt;
+    state_predict(0) = (r * std::cos(new_delta) - pose_p.translation().x()) + (linear * dt * std::cos(0));
+    state_predict(1) = (r * std::sin(new_delta) - pose_p.translation().y()) + (linear * dt * std::sin(0));
+    state_predict(2) = robot_velocity_input_(1) * dt;
+
+    return state_predict;
+  }
+
 private:
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_subscription_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_publisher_;
   rclcpp::TimerBase::SharedPtr timer_;
 
   bool has_detected_marker_;
+  int detected_count_;
+
+  double max_anguler_vel_;
+  double max_linear_vel_;
 
   cv::Mat camera_intrinsic_;
   cv::Mat camera_dist_coeffs_;
@@ -172,9 +325,14 @@ private:
 
   Eigen::Isometry3d detect_marker_pose_;
   Eigen::Isometry3d T_world_image_;
+  Eigen::Isometry3d robot_pose_;
+  Eigen::Vector2d robot_velocity_input_;
 
   std::shared_ptr<ArucoMarkerDetector> aruco_marker_detector_ptr_;
   std::shared_ptr<ArucoKalmanFilter> aruco_kalman_filter_ptr_;
+  std::shared_ptr<PDController> PD_controller_ptr_;
+
+  Step current_step_;
 };
 
 int main(int argc, char **argv) {
