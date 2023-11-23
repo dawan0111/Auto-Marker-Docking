@@ -1,6 +1,5 @@
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
-#include "rclcpp_components/register_node_macro.hpp"
 
 #include <cstdio>
 #include <cmath>
@@ -18,6 +17,8 @@
 
 #include <tf2_eigen/tf2_eigen.h>
 
+#include "auto_marker_docking_interface/action/marker_docking.hpp"
+
 #include "auto_marker_docking/aruco_marker_detector.hpp"
 #include "auto_marker_docking/aruco_kalman_filter.hpp"
 #include "auto_marker_docking/PD_controller.hpp"
@@ -34,19 +35,205 @@ public:
       END
   };
 
+  using MarkerDocking = auto_marker_docking_interface::action::MarkerDocking;
+  using GoalHandleMarkerDocking = rclcpp_action::ServerGoalHandle<MarkerDocking>;
+
   AutoMarkerDockingActionServer() : Node("auto_marker_docking_node") {
     current_step_ = DETECTION;
     RCLCPP_INFO(this->get_logger(), "auto_marker_docking_node");
 
     tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
-
     cmd_vel_publisher_ = this->create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
-
     image_subscription_ = this->create_subscription<sensor_msgs::msg::Image>(
         "/camera/image_raw", 10,
         std::bind(&AutoMarkerDockingActionServer::image_callback_, this,
                   std::placeholders::_1));
 
+    configure();
+    
+    using namespace std::placeholders;
+
+    this->action_server_ = rclcpp_action::create_server<MarkerDocking>(
+      this,
+      "aruco_marker_docking",
+      std::bind(&AutoMarkerDockingActionServer::handle_goal, this, _1, _2),
+      std::bind(&AutoMarkerDockingActionServer::handle_cancel, this, _1),
+      std::bind(&AutoMarkerDockingActionServer::handle_accepted, this, _1));
+  }
+
+private:
+  rclcpp_action::Server<MarkerDocking>::SharedPtr action_server_;
+
+  rclcpp_action::GoalResponse handle_goal(
+    const rclcpp_action::GoalUUID & uuid,
+    std::shared_ptr<const MarkerDocking::Goal> goal)
+  {
+    RCLCPP_INFO(this->get_logger(), "Received goal request with marker robot gap %f m", goal->marker_gap);
+    (void)uuid;
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+  }
+
+  rclcpp_action::CancelResponse handle_cancel(
+    const std::shared_ptr<GoalHandleMarkerDocking> goal_handle)
+  {
+    RCLCPP_INFO(this->get_logger(), "Received request to cancel goal");
+    (void)goal_handle;
+    return rclcpp_action::CancelResponse::ACCEPT;
+  }
+
+  void handle_accepted(const std::shared_ptr<GoalHandleMarkerDocking> goal_handle)
+  {
+    using namespace std::placeholders;
+    std::thread{std::bind(&AutoMarkerDockingActionServer::execute, this, _1), goal_handle}.detach();
+  }
+
+  void execute(const std::shared_ptr<GoalHandleMarkerDocking> goal_handle)
+  {
+    RCLCPP_INFO(this->get_logger(), "Executing docking");
+    detected_count_ = 0;
+    current_step_ = DETECTION;
+    rclcpp::Rate loop_rate(std::chrono::milliseconds(30));
+    const auto goal = goal_handle->get_goal();
+
+    auto feedback = std::make_shared<MarkerDocking::Feedback>();
+    auto result = std::make_shared<MarkerDocking::Result>();
+
+    while (rclcpp::ok()) {
+      if (goal_handle->is_canceling()) {
+        result->success = false;
+        goal_handle->canceled(result);
+        RCLCPP_INFO(this->get_logger(), "Docking canceled");
+
+        return;
+      }
+
+      if (has_detected_marker_) {
+        Eigen::Vector3d state_predict = get_predict_vector(0.03);
+        aruco_kalman_filter_ptr_->predict(state_predict);
+
+        Eigen::Isometry3d filter_marker_pose = aruco_kalman_filter_ptr_->get_state();
+        Eigen::Isometry3d T_aruco_waypoint = Eigen::Isometry3d::Identity();
+
+        T_aruco_waypoint.translate(Eigen::Vector3d(0.4, 0.0, 0.0));
+        Eigen::Isometry3d aruco_waypoint_pose  = filter_marker_pose * T_aruco_waypoint;
+
+        auto translation = aruco_waypoint_pose.translation();
+        auto euler = aruco_waypoint_pose.rotation().eulerAngles(2, 1, 0);
+
+        if (current_step_ == ARUCO_1 || current_step_ == ARUCO_2) {
+          translation = filter_marker_pose.translation();
+          euler = filter_marker_pose.rotation().eulerAngles(2, 1, 0);
+        }
+
+        Eigen::Vector3d output = PD_controller_ptr_->update(
+          Eigen::Vector3d(translation(0) * -1.0, translation(1) * -1.0, euler[0]),
+          30
+        );
+        Eigen::Vector2d velocity = xy_to_polar_coordinates(output(0), output(1));
+
+        if (velocity(0) < max_linear_vel_ * -1) {
+          velocity(0) = max_linear_vel_ * -1;
+        }
+        if (velocity(0) > max_linear_vel_) {
+          velocity(0) = max_linear_vel_;
+        }
+
+        if (velocity(1) < max_anguler_vel_ * -1) {
+          velocity(1) = max_anguler_vel_ * -1;
+        }
+        if (velocity(1) > max_anguler_vel_) {
+          velocity(1) = max_anguler_vel_;
+        }
+        
+
+        if (current_step_ == DETECTION) {
+          if (detected_count_ >= 100) {
+            current_step_ = WAYPOINT_1;
+            RCLCPP_INFO(this->get_logger(), "change step: DETECTION -> WAYPOINT_1");
+
+          }
+        } else if (current_step_ == WAYPOINT_1) {
+          robot_velocity_input_(0) = 0.0;
+          robot_velocity_input_(1) = velocity(1);
+
+          if (std::abs(translation(1)) <= 0.02) {
+            current_step_ = WAYPOINT_2;
+            RCLCPP_INFO(this->get_logger(), "change step: WAYPOINT_1 -> WAYPOINT_2");
+          }
+        } else if (current_step_ == WAYPOINT_2) {
+          robot_velocity_input_(0) = velocity(0);
+          robot_velocity_input_(1) = 0.0;
+
+          if (std::abs(translation(0)) <= 0.02) {
+            current_step_ = ARUCO_1;
+            RCLCPP_INFO(this->get_logger(), "change step: WAYPOINT_2 -> ARUCO_1");
+          }
+        } else if (current_step_ == ARUCO_1) {
+          robot_velocity_input_(0) = 0.0;
+          robot_velocity_input_(1) = velocity(1);
+
+          if (std::abs(translation(1)) <= 0.02) {
+            current_step_ = ARUCO_2;
+            RCLCPP_INFO(this->get_logger(), "change step: ARUCO_1 -> ARUCO_2");
+          }
+        } else if (current_step_ == ARUCO_2) {
+          bool linear_finish = false;
+          bool anguler_finish = false;
+          robot_velocity_input_(0) = velocity(0);
+          robot_velocity_input_(1) = velocity(1);
+
+          if (std::abs(translation(0)) <= goal->marker_gap) {
+            linear_finish = true;
+            robot_velocity_input_(0) = 0.0;
+          }
+
+          if (std::abs(translation(1)) <= 0.02) {
+            anguler_finish = true;
+            robot_velocity_input_(1) = 0.0;
+          }
+
+          if (linear_finish && anguler_finish) {
+            current_step_ = END;
+            RCLCPP_INFO(this->get_logger(), "change step: ARUCO_2 -> END");
+          }
+        } else {
+          robot_velocity_input_(0) = 0.0;
+          robot_velocity_input_(1) = 0.0;
+          publish_cmd_vel();
+          break;
+        }
+
+        publish_cmd_vel();
+        send_aruco_transform(filter_marker_pose, "camera_link", "filter_aruco_link");
+        send_aruco_transform(aruco_waypoint_pose, "camera_link", "aruco_waypoint1"); 
+      }
+
+      feedback->step = static_cast<int>(current_step_);
+      goal_handle->publish_feedback(feedback);
+      loop_rate.sleep();
+    }
+    // Check if goal is done
+    if (rclcpp::ok()) {
+      result->success = true;
+      goal_handle->succeed(result);
+      RCLCPP_INFO(this->get_logger(), "Goal succeeded");
+    }
+  }
+
+  void image_callback_(const sensor_msgs::msg::Image::SharedPtr msg) {
+    cv_bridge::CvImagePtr cv_ptr;
+    try {
+      cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+      cv::Mat cv_image = cv_ptr->image;
+      detect_aruco_marker(cv_image);
+
+    } catch (cv_bridge::Exception &e) {
+      RCLCPP_ERROR(this->get_logger(), "Could not convert from '%s' to 'bgr8'.",
+                   msg->encoding.c_str());
+    }
+  }
+
+  void configure() {
     camera_intrinsic_ = (cv::Mat_<float>(3, 3) << 1696.80268, 0.0, 960.5, 0.0,
                          1696.80268, 540.5, 0.0, 0.0, 1.0);
     camera_dist_coeffs_ = (cv::Mat_<float>(1, 5) << 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -107,24 +294,6 @@ public:
 
     has_detected_marker_ = false;
     detected_count_ = 0;
-
-    timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(30), 
-            std::bind(&AutoMarkerDockingActionServer::timer_callback, this));
-  }
-
-private:
-  void image_callback_(const sensor_msgs::msg::Image::SharedPtr msg) {
-    cv_bridge::CvImagePtr cv_ptr;
-    try {
-      cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
-      cv::Mat cv_image = cv_ptr->image;
-      detect_aruco_marker(cv_image);
-
-    } catch (cv_bridge::Exception &e) {
-      RCLCPP_ERROR(this->get_logger(), "Could not convert from '%s' to 'bgr8'.",
-                   msg->encoding.c_str());
-    }
   }
 
   void publish_cmd_vel()
@@ -134,108 +303,6 @@ private:
     message.angular.z = robot_velocity_input_(1);
 
     cmd_vel_publisher_->publish(message);
-  }
-
-  void timer_callback()
-  {
-    if (has_detected_marker_) {
-      Eigen::Vector3d state_predict = get_predict_vector(0.03);
-      aruco_kalman_filter_ptr_->predict(state_predict);
-
-      Eigen::Isometry3d filter_marker_pose = aruco_kalman_filter_ptr_->get_state();
-      Eigen::Isometry3d T_aruco_waypoint = Eigen::Isometry3d::Identity();
-
-      T_aruco_waypoint.translate(Eigen::Vector3d(0.4, 0.0, 0.0));
-      Eigen::Isometry3d aruco_waypoint_pose  = filter_marker_pose * T_aruco_waypoint;
-
-      auto translation = aruco_waypoint_pose.translation();
-      auto euler = aruco_waypoint_pose.rotation().eulerAngles(2, 1, 0);
-
-      if (current_step_ == ARUCO_1 || current_step_ == ARUCO_2) {
-        translation = filter_marker_pose.translation();
-        euler = filter_marker_pose.rotation().eulerAngles(2, 1, 0);
-      }
-
-      Eigen::Vector3d output = PD_controller_ptr_->update(
-        Eigen::Vector3d(translation(0) * -1.0, translation(1) * -1.0, euler[0]),
-        30
-      );
-      Eigen::Vector2d velocity = xy_to_polar_coordinates(output(0), output(1));
-
-      if (velocity(0) < max_linear_vel_ * -1) {
-        velocity(0) = max_linear_vel_ * -1;
-      }
-      if (velocity(0) > max_linear_vel_) {
-        velocity(0) = max_linear_vel_;
-      }
-
-      if (velocity(1) < max_anguler_vel_ * -1) {
-        velocity(1) = max_anguler_vel_ * -1;
-      }
-      if (velocity(1) > max_anguler_vel_) {
-        velocity(1) = max_anguler_vel_;
-      }
-      
-
-      if (current_step_ == DETECTION) {
-        if (detected_count_ >= 100) {
-          current_step_ = WAYPOINT_1;
-          RCLCPP_INFO(this->get_logger(), "change step: DETECTION -> WAYPOINT_1");
-
-        }
-      } else if (current_step_ == WAYPOINT_1) {
-        robot_velocity_input_(0) = 0.0;
-        robot_velocity_input_(1) = velocity(1);
-
-        if (std::abs(velocity(1)) <= 0.075) {
-          current_step_ = WAYPOINT_2;
-          RCLCPP_INFO(this->get_logger(), "change step: WAYPOINT_1 -> WAYPOINT_2");
-        }
-      } else if (current_step_ == WAYPOINT_2) {
-        robot_velocity_input_(0) = velocity(0);
-        robot_velocity_input_(1) = 0.0;
-
-        if (std::abs(translation(0)) <= 0.02) {
-          current_step_ = ARUCO_1;
-          RCLCPP_INFO(this->get_logger(), "change step: WAYPOINT_2 -> ARUCO_1");
-        }
-      } else if (current_step_ == ARUCO_1) {
-        robot_velocity_input_(0) = 0.0;
-        robot_velocity_input_(1) = velocity(1);
-
-        if (std::abs(velocity(1)) <= 0.0075) {
-          current_step_ = ARUCO_2;
-          RCLCPP_INFO(this->get_logger(), "change step: ARUCO_1 -> ARUCO_2");
-        }
-      } else if (current_step_ == ARUCO_2) {
-        bool linear_finish = false;
-        bool anguler_finish = false;
-        robot_velocity_input_(0) = velocity(0);
-        robot_velocity_input_(1) = velocity(1);
-
-        if (std::abs(translation(0)) <= 0.1) {
-          linear_finish = true;
-          robot_velocity_input_(0) = 0.0;
-        }
-
-        if (std::abs(velocity(1)) <= 0.001) {
-          anguler_finish = true;
-          robot_velocity_input_(1) = 0.0;
-        }
-
-        if (linear_finish && anguler_finish) {
-          current_step_ = END;
-          RCLCPP_INFO(this->get_logger(), "change step: ARUCO_2 -> END");
-        }
-      } else {
-        robot_velocity_input_(0) = 0.0;
-        robot_velocity_input_(1) = 0.0;
-      }
-
-      publish_cmd_vel();
-      send_aruco_transform(filter_marker_pose, "camera_link", "filter_aruco_link");
-      send_aruco_transform(aruco_waypoint_pose, "camera_link", "aruco_waypoint1"); 
-    }
   }
 
   void detect_aruco_marker(const cv::Mat& image) {
