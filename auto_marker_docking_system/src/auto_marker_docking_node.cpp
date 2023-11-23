@@ -38,18 +38,19 @@ public:
   using MarkerDocking = auto_marker_docking_interface::action::MarkerDocking;
   using GoalHandleMarkerDocking = rclcpp_action::ServerGoalHandle<MarkerDocking>;
 
-  AutoMarkerDockingActionServer() : Node("auto_marker_docking_node") {
-    current_step_ = DETECTION;
-    RCLCPP_INFO(this->get_logger(), "auto_marker_docking_node");
-
-    tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
-    cmd_vel_publisher_ = this->create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
-    image_subscription_ = this->create_subscription<sensor_msgs::msg::Image>(
-        "/camera/image_raw", 10,
-        std::bind(&AutoMarkerDockingActionServer::image_callback_, this,
-                  std::placeholders::_1));
+  AutoMarkerDockingActionServer() : Node("auto_marker_docking_action_server") {
+    RCLCPP_INFO(this->get_logger(), "===== auto_marker_docking_action_server configure =====");
 
     configure();
+
+    current_step_ = DETECTION;
+
+    tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+    cmd_vel_publisher_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
+    image_subscription_ = this->create_subscription<sensor_msgs::msg::Image>(
+        camera_topic_, 10,
+        std::bind(&AutoMarkerDockingActionServer::image_callback_, this,
+                  std::placeholders::_1));
     
     using namespace std::placeholders;
 
@@ -204,8 +205,8 @@ private:
         }
 
         publish_cmd_vel();
-        send_aruco_transform(filter_marker_pose, "camera_link", "filter_aruco_link");
-        send_aruco_transform(aruco_waypoint_pose, "camera_link", "aruco_waypoint1"); 
+        send_aruco_transform(filter_marker_pose, camera_link_name_, "filter_aruco_link");
+        send_aruco_transform(aruco_waypoint_pose, camera_link_name_, "aruco_waypoint1"); 
       }
 
       feedback->step = static_cast<int>(current_step_);
@@ -234,11 +235,78 @@ private:
   }
 
   void configure() {
-    camera_intrinsic_ = (cv::Mat_<float>(3, 3) << 1696.80268, 0.0, 960.5, 0.0,
-                         1696.80268, 540.5, 0.0, 0.0, 1.0);
-    camera_dist_coeffs_ = (cv::Mat_<float>(1, 5) << 0.0, 0.0, 0.0, 0.0, 0.0);
-    aruco_marker_size_ = 0.1;
-    aurco_marker_dictionary_id_ = cv::aruco::DICT_6X6_250;
+    std::vector<double> camera_intrinsic_values = {
+      1696.80268, 0.0, 960.5,
+      0.0, 1696.80268, 540.5,
+      0.0, 0.0, 1.0
+    };;
+    std::vector<double> camera_dist_coeffs_values = {0.0, 0.0, 0.0, 0.0, 0.0};
+
+    std::vector<double> initial_covariance = {
+      0.01, 0.0, 0.0,
+      0.0, 0.01, 0.0,
+      0.0, 0.0, 0.005
+    };
+    std::vector<double> predict_covariance = {
+      0.005, 0.0, 0.0,
+      0.0, 0.005, 0.0,
+      0.0, 0.0, 0.001
+    };
+    std::vector<double> measure_covariance = {
+      0.005, 0.0, 0.0,
+      0.0, 0.005, 0.0,
+      0.0, 0.0, 0.18
+    };;
+
+    std::vector<double> P_gain = {0.25, 0.25, 0.25};
+    std::vector<double> D_gain = {0.01, 0.01, 0.01};
+
+    this->declare_parameter("camera_topic", "/camera/image_raw");
+    this->get_parameter("camera_topic", camera_topic_);
+
+    std::cout  <<  "camera_topic: " << camera_topic_ << std::endl;
+
+    this->declare_parameter("camera_link_name", "camera_link");
+    this->get_parameter("camera_link_name", camera_link_name_);
+
+    this->declare_parameter("camera_intrinsic_matrix", camera_intrinsic_values);
+    this->get_parameter("camera_intrinsic_matrix", camera_intrinsic_values);
+
+    this->declare_parameter("camera_dist_coeffs", camera_dist_coeffs_values);
+    this->get_parameter("camera_dist_coeffs", camera_dist_coeffs_values);
+    
+    this->declare_parameter("aruco_marker_size", 0.1);
+    this->get_parameter("aruco_marker_size", aruco_marker_size_);
+
+    this->declare_parameter("aurco_marker_dictionary_id", 10);
+    this->get_parameter("aurco_marker_dictionary_id", aurco_marker_dictionary_id_);
+
+    this->declare_parameter("initial_covariance", initial_covariance);
+    this->get_parameter("initial_covariance", initial_covariance);
+
+    this->get_parameter("predict_covariance", predict_covariance);
+    this->declare_parameter("predict_covariance", predict_covariance);
+
+    this->get_parameter("measure_covariance", measure_covariance);
+    this->declare_parameter("measure_covariance", measure_covariance);
+
+    this->declare_parameter("cmd_vel_topic", "cmd_vel");
+    this->get_parameter("cmd_vel_topic", cmd_vel_topic_);
+
+    this->declare_parameter("max_anguler_vel", 0.25);
+    this->get_parameter("max_anguler_vel", max_anguler_vel_);
+
+    this->declare_parameter("max_linear_vel", 0.3);
+    this->get_parameter("max_linear_vel", max_linear_vel_);
+
+    this->declare_parameter("P_gain", P_gain);
+    this->get_parameter("P_gain", P_gain);
+
+    this->declare_parameter("D_gain", D_gain);
+    this->get_parameter("D_gain", D_gain);
+
+    camera_intrinsic_ = cv::Mat(3, 3, CV_64F, camera_intrinsic_values.data());
+    camera_dist_coeffs_ = cv::Mat(1, 5, CV_64F, camera_dist_coeffs_values.data());
     detect_marker_pose_ = Eigen::Isometry3d::Identity();
 
     T_world_image_ = Eigen::Isometry3d::Identity(); // image to world
@@ -261,18 +329,18 @@ private:
     Eigen::Matrix3d predict_noise;    
     Eigen::Matrix3d measure_noise;
 
-    initial_pose << 0, 0, 0;
-    initial_conv << 0.01, 0, 0,
-                    0, 0.01, 0,
-                    0, 0, 0.005;
+    initial_pose << 0.0, 0.0, 0.0;
+    initial_conv << initial_covariance[0], 0.0, 0.0,
+                    0.0, initial_covariance[4], 0.0,
+                    0.0, 0.0, initial_covariance[8];
 
-    predict_noise << 0.005, 0, 0,
-                    0, 0.005, 0,
-                    0, 0, 0.001;
+    predict_noise << predict_covariance[0], 0.0, 0.0,
+                    0.0, predict_covariance[4], 0.0,
+                    0.0, 0.0, predict_covariance[8];
 
-    measure_noise << 0.005, 0, 0,
-                    0, 0.005, 0,
-                    0, 0, 0.18;
+    measure_noise << measure_covariance[0], 0.0, 0.0,
+                    0.0, measure_covariance[4], 0.0,
+                    0.0, 0.0, measure_covariance[8];
 
     aruco_kalman_filter_ptr_ = std::make_shared<ArucoKalmanFilter>(initial_pose, initial_conv, predict_noise, measure_noise);
 
@@ -280,17 +348,14 @@ private:
     Eigen::Vector3d p_gain;    
     Eigen::Vector3d d_gain;
 
-    p_gain << 0.25, 0.25, 0.25;    
-    d_gain << 0.01, 0.01, 0.01;    
+    p_gain << P_gain[0], P_gain[1], P_gain[2];    
+    d_gain << D_gain[0], D_gain[1], D_gain[2];
 
     PD_controller_ptr_ = std::make_shared<PDController>(p_gain, d_gain);
     PD_controller_ptr_->set_target(Eigen::Vector3d(0.0, 0.0, 0.0));
 
     robot_pose_ = Eigen::Isometry3d();
     robot_velocity_input_ = Eigen::Vector2d::Zero();
-
-    max_anguler_vel_ = 0.25;
-    max_linear_vel_ = 0.3;
 
     has_detected_marker_ = false;
     detected_count_ = 0;
@@ -382,9 +447,12 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_publisher_;
   rclcpp::TimerBase::SharedPtr timer_;
 
+  std::string camera_topic_;
+  std::string camera_link_name_;
   bool has_detected_marker_;
   int detected_count_;
 
+  std::string cmd_vel_topic_;
   double max_anguler_vel_;
   double max_linear_vel_;
 

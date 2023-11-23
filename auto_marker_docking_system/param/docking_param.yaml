@@ -1,0 +1,35 @@
+auto_marker_docking_action_server:
+  ros__parameters:
+    camera_topic: "/camera/image_raw"
+    camera_link_name: "camera_link"
+    camera_intrinsic_matrix: [
+      1696.80268, 0.0, 960.5,
+      0.0, 1696.80268, 540.5,
+      0.0, 0.0, 1.0
+    ]
+    camera_dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+    cmd_vel_topic: "/cmd_vel"
+    max_linear_vel_: 0.3
+    max_anguler_vel_: 0.25
+    P_gain: [0.25, 0.25, 0.25]
+    D_gain: [0.01, 0.01, 0.01]
+
+    aruco_marker_size: 0.1
+    aurco_marker_dictionary_id: 10
+    
+    initial_covariance: [
+      0.01, 0.0, 0.0,
+      0.0, 0.01, 0.0,
+      0.0, 0.0, 0.005
+    ]
+    predict_covariance: [
+      0.005, 0.0, 0.0,
+      0.0, 0.005, 0.0,
+      0.0, 0.0, 0.001
+    ]
+    measure_covariance: [
+      0.005, 0.0, 0.0,
+      0.0, 0.005, 0.0,
+      0.0, 0.0, 0.18
+    ]

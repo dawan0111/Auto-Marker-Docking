@@ -38,6 +38,11 @@ ament_target_dependencies(auto_marker_docking_node
 install(TARGETS auto_marker_docking_node
   DESTINATION lib/${PROJECT_NAME})
 
+install (DIRECTORY
+  launch param
+  DESTINATION share/${PROJECT_NAME}
+)
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
