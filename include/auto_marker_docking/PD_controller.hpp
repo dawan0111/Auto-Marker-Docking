@@ -11,7 +11,7 @@ public:
     PDController(const Eigen::Vector3d& kp, const Eigen::Vector3d& kd);
 
     // 목표값 설정
-    void setTarget(const Eigen::Vector3d& target);
+    void set_target(const Eigen::Vector3d& target);
 
     // 현재값 업데이트 및 제어 신호 계산
     Eigen::Vector3d update(const Eigen::Vector3d& measurement, double dt);
